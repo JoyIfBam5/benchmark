@@ -38,12 +38,12 @@ int main(int argc, char** argv) {
 // of memcpy() calls of different lengths:
 
 static void BM_memcpy(benchmark::State& state) {
-  char* src = new char[state.range_x()]; char* dst = new char[state.range_x()];
-  memset(src, 'x', state.range_x());
+  char* src = new char[state.range(0)]; char* dst = new char[state.range(0)];
+  memset(src, 'x', state.range(0));
   while (state.KeepRunning())
-    memcpy(dst, src, state.range_x());
+    memcpy(dst, src, state.range(0));
   state.SetBytesProcessed(int64_t(state.iterations()) *
-                          int64_t(state.range_x()));
+                          int64_t(state.range(0)));
   delete[] src; delete[] dst;
 }
 BENCHMARK(BM_memcpy)->Arg(8)->Arg(64)->Arg(512)->Arg(1<<10)->Arg(8<<10);
@@ -60,27 +60,27 @@ BENCHMARK(BM_memcpy)->Range(8, 8<<10);
 static void BM_SetInsert(benchmark::State& state) {
   while (state.KeepRunning()) {
     state.PauseTiming();
-    set<int> data = ConstructRandomSet(state.range_x());
+    set<int> data = ConstructRandomSet(state.range(0));
     state.ResumeTiming();
-    for (int j = 0; j < state.range_y(); ++j)
+    for (int j = 0; j < state.range(1); ++j)
       data.insert(RandomNumber());
   }
 }
 BENCHMARK(BM_SetInsert)
-   ->ArgPair(1<<10, 1)
-   ->ArgPair(1<<10, 8)
-   ->ArgPair(1<<10, 64)
-   ->ArgPair(1<<10, 512)
-   ->ArgPair(8<<10, 1)
-   ->ArgPair(8<<10, 8)
-   ->ArgPair(8<<10, 64)
-   ->ArgPair(8<<10, 512);
+   ->Args({1<<10, 1})
+   ->Args({1<<10, 8})
+   ->Args({1<<10, 64})
+   ->Args({1<<10, 512})
+   ->Args({8<<10, 1})
+   ->Args({8<<10, 8})
+   ->Args({8<<10, 64})
+   ->Args({8<<10, 512});
 
 // The preceding code is quite repetitive, and can be replaced with
 // the following short-hand.  The following macro will pick a few
 // appropriate arguments in the product of the two specified ranges
 // and will generate a microbenchmark for each such pair.
-BENCHMARK(BM_SetInsert)->RangePair(1<<10, 8<<10, 1, 512);
+BENCHMARK(BM_SetInsert)->Ranges({{1<<10, 8<<10}, {1, 512}});
 
 // For more complex patterns of inputs, passing a custom function
 // to Apply allows programmatic specification of an
@@ -90,7 +90,7 @@ BENCHMARK(BM_SetInsert)->RangePair(1<<10, 8<<10, 1, 512);
 static void CustomArguments(benchmark::internal::Benchmark* b) {
   for (int i = 0; i <= 10; ++i)
     for (int j = 32; j <= 1024*1024; j *= 8)
-      b->ArgPair(i, j);
+      b->Args({i, j});
 }
 BENCHMARK(BM_SetInsert)->Apply(CustomArguments);
 
@@ -101,14 +101,14 @@ template <class Q> int BM_Sequential(benchmark::State& state) {
   Q q;
   typename Q::value_type v;
   while (state.KeepRunning()) {
-    for (int i = state.range_x(); i--; )
+    for (int i = state.range(0); i--; )
       q.push(v);
-    for (int e = state.range_x(); e--; )
+    for (int e = state.range(0); e--; )
       q.Wait(&v);
   }
   // actually messages, not bytes:
   state.SetBytesProcessed(
-      static_cast<int64_t>(state.iterations())*state.range_x());
+      static_cast<int64_t>(state.iterations())*state.range(0));
 }
 BENCHMARK_TEMPLATE(BM_Sequential, WaitQueue<int>)->Range(1<<0, 1<<10);
 
@@ -152,6 +152,9 @@ BENCHMARK(BM_test)->Unit(benchmark::kMillisecond);
 #include <assert.h>
 #include <stddef.h>
 #include <stdint.h>
+
+#include <vector>
+#include <string>
 
 #include "macros.h"
 
@@ -212,6 +215,10 @@ void UseCharPointer(char const volatile*);
 // registered benchmark.
 Benchmark* RegisterBenchmarkInternal(Benchmark*);
 
+// Ensure that the standard streams are properly initialized in every TU.
+int InitializeStreams();
+BENCHMARK_UNUSED static int stream_init_anchor = InitializeStreams();
+
 } // end namespace internal
 
 
@@ -264,31 +271,36 @@ enum BigO {
 // computational complexity for the benchmark.
 typedef double(BigOFunc)(int);
 
+namespace internal {
+class ThreadTimer;
+class ThreadManager;
+
+#if defined(BENCHMARK_HAS_CXX11)
+enum ReportMode : unsigned {
+#else
+enum ReportMode {
+#endif
+    RM_Unspecified, // The mode has not been manually specified
+    RM_Default,     // The mode is user-specified as default.
+    RM_ReportAggregatesOnly
+};
+
+}
+
 // State is passed to a running Benchmark and contains state for the
 // benchmark to use.
 class State {
 public:
-  State(size_t max_iters, bool has_x, int x, bool has_y, int y,
-        int thread_i, int n_threads);
-
   // Returns true if the benchmark should continue through another iteration.
   // NOTE: A benchmark may not return from the test until KeepRunning() has
   // returned false.
   bool KeepRunning() {
     if (BENCHMARK_BUILTIN_EXPECT(!started_, false)) {
-      assert(!finished_);
-      started_ = true;
-      ResumeTiming();
+      StartKeepRunning();
     }
     bool const res = total_iterations_++ < max_iterations;
     if (BENCHMARK_BUILTIN_EXPECT(!res, false)) {
-      assert(started_ && (!finished_ || error_occurred_));
-      if (!error_occurred_) {
-        PauseTiming();
-      }
-      // Total iterations now is one greater than max iterations. Fix this.
-      total_iterations_ = max_iterations;
-      finished_ = true;
+      FinishKeepRunning();
     }
     return res;
   }
@@ -298,10 +310,11 @@ public:
   // Stop the benchmark timer.  If not called, the timer will be
   // automatically stopped after KeepRunning() returns false for the first time.
   //
-  // For threaded benchmarks the PauseTiming() function acts
-  // like a barrier.  I.e., the ith call by a particular thread to this
-  // function will block until all active threads have made their ith call.
-  // The timer will stop when the last thread has called this function.
+  // For threaded benchmarks the PauseTiming() function only pauses the timing
+  // for the current thread.
+  //
+  // NOTE: The "real time" measurement is per-thread. If different threads
+  // report different measurements the largest one is reported.
   //
   // NOTE: PauseTiming()/ResumeTiming() are relatively
   // heavyweight, and so their use should generally be avoided
@@ -312,11 +325,6 @@ public:
   //           by the current thread.
   // Start the benchmark timer.  The timer is NOT running on entrance to the
   // benchmark function. It begins running after the first call to KeepRunning()
-  //
-  // For threaded benchmarks the ResumeTiming() function acts
-  // like a barrier.  I.e., the ith call by a particular thread to this
-  // function will block until all active threads have made their ith call.
-  // The timer will start when the last thread has called this function.
   //
   // NOTE: PauseTiming()/ResumeTiming() are relatively
   // heavyweight, and so their use should generally be avoided
@@ -329,10 +337,10 @@ public:
   // thread and report an error with the specified 'msg'. After this call
   // the user may explicitly 'return' from the benchmark.
   //
-  // For threaded benchmarks only the current thread stops executing. If
-  // multiple threads report an error only the first error message is used.
-  // The current thread is no longer considered 'active' by
-  // 'PauseTiming()' and 'ResumingTiming()'.
+  // For threaded benchmarks only the current thread stops executing and future
+  // calls to `KeepRunning()` will block until all threads have completed
+  // the `KeepRunning()` loop. If multiple threads report an error only the
+  // first error message is used.
   //
   // NOTE: Calling 'SkipWithError(...)' does not cause the benchmark to exit
   // the current scope immediately. If the function is called from within
@@ -345,10 +353,8 @@ public:
   // is used instead of automatically measured time if UseManualTime() was
   // specified.
   //
-  // For threaded benchmarks the SetIterationTime() function acts
-  // like a barrier.  I.e., the ith call by a particular thread to this
-  // function will block until all threads have made their ith call.
-  // The time will be set by the last thread to call this function.
+  // For threaded benchmarks the final value will be set to the largest
+  // reported values.
   void SetIterationTime(double seconds);
 
   // Set the number of bytes processed by the current benchmark
@@ -423,18 +429,16 @@ public:
 
   // Range arguments for this run. CHECKs if the argument has been set.
   BENCHMARK_ALWAYS_INLINE
-  int range_x() const {
-    assert(has_range_x_);
-    ((void)has_range_x_); // Prevent unused warning.
-    return range_x_;
+  int range(std::size_t pos = 0) const {
+      assert(range_.size() > pos);
+      return range_[pos];
   }
 
-  BENCHMARK_ALWAYS_INLINE
-  int range_y() const {
-    assert(has_range_y_);
-    ((void)has_range_y_); // Prevent unused warning.
-    return range_y_;
-  }
+  BENCHMARK_DEPRECATED_MSG("use 'range(0)' instead")
+  int range_x() const { return range(0); }
+
+  BENCHMARK_DEPRECATED_MSG("use 'range(1)' instead")
+  int range_y() const { return range(1); }
 
   BENCHMARK_ALWAYS_INLINE
   size_t iterations() const { return total_iterations_; }
@@ -444,11 +448,7 @@ private:
   bool finished_;
   size_t total_iterations_;
 
-  bool has_range_x_;
-  int range_x_;
-
-  bool has_range_y_;
-  int range_y_;
+  std::vector<int> range_;
 
   size_t bytes_processed_;
   size_t items_processed_;
@@ -465,7 +465,16 @@ public:
   const int threads;
   const size_t max_iterations;
 
-private:
+  // TODO make me private
+  State(size_t max_iters, const std::vector<int>& ranges, int thread_i,
+        int n_threads, internal::ThreadTimer* timer,
+        internal::ThreadManager* manager);
+
+ private:
+  void StartKeepRunning();
+  void FinishKeepRunning();
+  internal::ThreadTimer* timer_;
+  internal::ThreadManager* manager_;
   BENCHMARK_DISALLOW_COPY_AND_ASSIGN(State);
 };
 
@@ -503,20 +512,38 @@ public:
   // REQUIRES: The function passed to the constructor must accept an arg1.
   Benchmark* DenseRange(int start, int limit, int step = 1);
 
-  // Run this benchmark once with "x,y" as the extra arguments passed
+  // Run this benchmark once with "args" as the extra arguments passed
   // to the function.
-  // REQUIRES: The function passed to the constructor must accept arg1,arg2.
-  Benchmark* ArgPair(int x, int y);
+  // REQUIRES: The function passed to the constructor must accept arg1, arg2 ...
+  Benchmark* Args(const std::vector<int>& args);
 
-  // Pick a set of values A from the range [lo1..hi1] and a set
-  // of values B from the range [lo2..hi2].  Run the benchmark for
-  // every pair of values in the cartesian product of A and B
-  // (i.e., for all combinations of the values in A and B).
-  // REQUIRES: The function passed to the constructor must accept arg1,arg2.
-  Benchmark* RangePair(int lo1, int hi1, int lo2, int hi2);
+  // Equivalent to Args({x, y})
+  // NOTE: This is a legacy C++03 interface provided for compatibility only.
+  //   New code should use 'Args'.
+  Benchmark* ArgPair(int x, int y) {
+      std::vector<int> args;
+      args.push_back(x);
+      args.push_back(y);
+      return Args(args);
+  }
+
+  // Run this benchmark once for a number of values picked from the
+  // ranges [start..limit].  (starts and limits are always picked.)
+  // REQUIRES: The function passed to the constructor must accept arg1, arg2 ...
+  Benchmark* Ranges(const std::vector<std::pair<int, int> >& ranges);
+
+  // Equivalent to Ranges({{lo1, hi1}, {lo2, hi2}}).
+  // NOTE: This is a legacy C++03 interface provided for compatibility only.
+  //   New code should use 'Ranges'.
+  Benchmark* RangePair(int lo1, int hi1, int lo2, int hi2) {
+      std::vector<std::pair<int, int> > ranges;
+      ranges.push_back(std::make_pair(lo1, hi1));
+      ranges.push_back(std::make_pair(lo2, hi2));
+      return Ranges(ranges);
+  }
 
   // Pass this benchmark object to *func, which can customize
-  // the benchmark by calling various methods like Arg, ArgPair,
+  // the benchmark by calling various methods like Arg, Args,
   // Threads, etc.
   Benchmark* Apply(void (*func)(Benchmark* benchmark));
 
@@ -533,6 +560,11 @@ public:
   // the `benchmark_repetitions` flag.
   // REQUIRES: `n > 0`
   Benchmark* Repetitions(int n);
+
+  // Specify if each repetition of the benchmark should be reported separately
+  // or if only the final statistics should be reported. If the benchmark
+  // is not repeated then the single result is always reported.
+  Benchmark* ReportAggregatesOnly(bool v = true);
 
   // If a particular benchmark is I/O bound, runs multiple threads internally or
   // if for some reason CPU timings are not representative, call this method. If
@@ -575,7 +607,13 @@ public:
   //    Foo in 4 threads
   //    Foo in 8 threads
   //    Foo in 16 threads
-  Benchmark* ThreadRange(int min_threads, int max_threads);
+  Benchmark *ThreadRange(int min_threads, int max_threads);
+
+  // For each value n in the range, run this benchmark once using n threads.
+  // min_threads and max_threads are always included in the range.
+  // stride specifies the increment. E.g. DenseThreadRange(1, 8, 3) starts
+  // a benchmark with 1, 4, 7 and 8 threads.
+  Benchmark *DenseThreadRange(int min_threads, int max_threads, int stride = 1);
 
   // Equivalent to ThreadRange(NumCPUs(), NumCPUs())
   Benchmark* ThreadPerCpu();
@@ -590,9 +628,25 @@ protected:
   Benchmark(Benchmark const&);
   void SetName(const char* name);
 
+  int ArgsCnt() const;
+
+  static void AddRange(std::vector<int>* dst, int lo, int hi, int mult);
+
 private:
   friend class BenchmarkFamilies;
-  BenchmarkImp* imp_;
+
+  std::string name_;
+  ReportMode report_mode_;
+  std::vector< std::vector<int> > args_;  // Args for all benchmark runs
+  TimeUnit time_unit_;
+  int range_multiplier_;
+  double min_time_;
+  int repetitions_;
+  bool use_real_time_;
+  bool use_manual_time_;
+  BigO complexity_;
+  BigOFunc* complexity_lambda_;
+  std::vector<int> thread_counts_;
 
   Benchmark& operator=(Benchmark const&);
 };
@@ -686,8 +740,12 @@ public:
       this->TearDown(st);
     }
 
+    // These will be deprecated ...
     virtual void SetUp(const State&) {}
     virtual void TearDown(const State&) {}
+    // ... In favor of these.
+    virtual void SetUp(State& st) { SetUp(const_cast<const State&>(st)); }
+    virtual void TearDown(State& st) { TearDown(const_cast<const State&>(st)); }
 
 protected:
     virtual void BenchmarkCase(State&) = 0;
@@ -725,11 +783,11 @@ protected:
 
 // Old-style macros
 #define BENCHMARK_WITH_ARG(n, a) BENCHMARK(n)->Arg((a))
-#define BENCHMARK_WITH_ARG2(n, a1, a2) BENCHMARK(n)->ArgPair((a1), (a2))
+#define BENCHMARK_WITH_ARG2(n, a1, a2) BENCHMARK(n)->Args({(a1), (a2)})
 #define BENCHMARK_WITH_UNIT(n, t) BENCHMARK(n)->Unit((t))
 #define BENCHMARK_RANGE(n, lo, hi) BENCHMARK(n)->Range((lo), (hi))
 #define BENCHMARK_RANGE2(n, l1, h1, l2, h2) \
-  BENCHMARK(n)->RangePair((l1), (h1), (l2), (h2))
+  BENCHMARK(n)->RangePair({{(l1), (h1)}, {(l2), (h2)}})
 
 #if __cplusplus >= 201103L
 
