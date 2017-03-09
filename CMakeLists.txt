@@ -190,6 +190,7 @@ if (BENCHMARK_ENABLE_TESTING)
 endif()
 
 #packaging
+find_package(Git)
 if(GIT_FOUND)
     execute_process(COMMAND ${GIT_EXECUTABLE} describe --abbrev=0 --tags
         WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
