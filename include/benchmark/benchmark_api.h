@@ -155,11 +155,13 @@ BENCHMARK(BM_test)->Unit(benchmark::kMillisecond);
 
 #include <string>
 #include <vector>
+#include <map>
 
 #include "macros.h"
 
 #if defined(BENCHMARK_HAS_CXX11)
 #include <type_traits>
+#include <initializer_list>
 #include <utility>
 #endif
 
@@ -167,6 +169,10 @@ namespace benchmark {
 class BenchmarkReporter;
 
 void Initialize(int* argc, char** argv);
+
+// Report to stdout all arguments in 'argv' as unrecognized except the first.
+// Returns true there is at least on unrecognized argument (i.e. 'argc' > 1).
+bool ReportUnrecognizedArguments(int argc, char** argv);
 
 // Generate a list of benchmarks matching the specified --benchmark_filter flag
 // and if --benchmark_list_tests is specified return after printing the name
@@ -226,7 +232,7 @@ BENCHMARK_UNUSED static int stream_init_anchor = InitializeStreams();
 // expression from being optimized away by the compiler. This function is
 // intended to add little to no overhead.
 // See: https://youtu.be/nXaxk27zwlk?t=2441
-#if defined(__GNUC__)
+#if defined(__GNUC__) && !defined(__pnacl__) && !defined(EMSCRIPTEN)
 template <class Tp>
 inline BENCHMARK_ALWAYS_INLINE void DoNotOptimize(Tp const& value) {
   asm volatile("" : : "g"(value) : "memory");
@@ -243,6 +249,39 @@ inline BENCHMARK_ALWAYS_INLINE void DoNotOptimize(Tp const& value) {
 }
 // FIXME Add ClobberMemory() for non-gnu compilers
 #endif
+
+
+
+// This class is used for user-defined counters.
+class Counter {
+public:
+
+  enum Flags {
+    kDefaults   = 0,
+    // Mark the counter as a rate. It will be presented divided
+    // by the duration of the benchmark.
+    kIsRate     = 1,
+    // Mark the counter as a thread-average quantity. It will be
+    // presented divided by the number of threads.
+    kAvgThreads = 2,
+    // Mark the counter as a thread-average rate. See above.
+    kAvgThreadsRate = kIsRate|kAvgThreads
+  };
+
+  double value;
+  Flags  flags;
+
+  BENCHMARK_ALWAYS_INLINE
+  Counter(double v = 0., Flags f = kDefaults) : value(v), flags(f) {}
+
+  BENCHMARK_ALWAYS_INLINE operator double const& () const { return value; }
+  BENCHMARK_ALWAYS_INLINE operator double      & ()       { return value; }
+
+};
+
+// This is the container for the user-defined counters.
+typedef std::map<std::string, Counter> UserCounters;
+
 
 // TimeUnit is passed to a benchmark in order to specify the order of magnitude
 // for the measured time.
@@ -434,6 +473,8 @@ class State {
   bool error_occurred_;
 
  public:
+  // Container for user-defined counters.
+  UserCounters counters;
   // Index of the executing thread. Values from [0, threads).
   const int thread_index;
   // Number of threads concurrently executing the benchmark.
@@ -858,6 +899,7 @@ class Fixture : public internal::Benchmark {
 #define BENCHMARK_MAIN()                   \
   int main(int argc, char** argv) {        \
     ::benchmark::Initialize(&argc, argv);  \
+    if (::benchmark::ReportUnrecognizedArguments(argc, argv)) return 1; \
     ::benchmark::RunSpecifiedBenchmarks(); \
   }
 
