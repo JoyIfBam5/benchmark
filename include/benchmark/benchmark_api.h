@@ -165,6 +165,10 @@ BENCHMARK(BM_test)->Unit(benchmark::kMillisecond);
 #include <utility>
 #endif
 
+#if defined(_MSC_VER)
+#include <intrin.h> // for _ReadWriteBarrier
+#endif
+
 namespace benchmark {
 class BenchmarkReporter;
 
@@ -203,19 +207,6 @@ class Benchmark;
 class BenchmarkImp;
 class BenchmarkFamilies;
 
-template <class T>
-struct Voider {
-  typedef void type;
-};
-
-template <class T, class = void>
-struct EnableIfString {};
-
-template <class T>
-struct EnableIfString<T, typename Voider<typename T::basic_string>::type> {
-  typedef int type;
-};
-
 void UseCharPointer(char const volatile*);
 
 // Take ownership of the pointer and register the benchmark. Return the
@@ -228,26 +219,47 @@ BENCHMARK_UNUSED static int stream_init_anchor = InitializeStreams();
 
 }  // end namespace internal
 
+
+#if !defined(__GNUC__) || defined(__pnacl__) || defined(EMSCRIPTN)
+# define BENCHMARK_HAS_NO_INLINE_ASSEMBLY
+#endif
+
 // The DoNotOptimize(...) function can be used to prevent a value or
 // expression from being optimized away by the compiler. This function is
 // intended to add little to no overhead.
 // See: https://youtu.be/nXaxk27zwlk?t=2441
-#if defined(__GNUC__) && !defined(__pnacl__) && !defined(EMSCRIPTEN)
+#ifndef BENCHMARK_HAS_NO_INLINE_ASSEMBLY
 template <class Tp>
 inline BENCHMARK_ALWAYS_INLINE void DoNotOptimize(Tp const& value) {
+  // Clang doesn't like the 'X' constraint on `value` and certain GCC versions
+  // don't like the 'g' constraint. Attempt to placate them both.
+#if defined(__clang__)
   asm volatile("" : : "g"(value) : "memory");
+#else
+  asm volatile("" : : "i,r,m"(value) : "memory");
+#endif
 }
 // Force the compiler to flush pending writes to global memory. Acts as an
 // effective read/write barrier
 inline BENCHMARK_ALWAYS_INLINE void ClobberMemory() {
   asm volatile("" : : : "memory");
 }
+#elif defined(_MSC_VER)
+template <class Tp>
+inline BENCHMARK_ALWAYS_INLINE void DoNotOptimize(Tp const& value) {
+  internal::UseCharPointer(&reinterpret_cast<char const volatile&>(value));
+  _ReadWriteBarrier();
+}
+
+inline BENCHMARK_ALWAYS_INLINE void ClobberMemory() {
+  _ReadWriteBarrier();
+}
 #else
 template <class Tp>
 inline BENCHMARK_ALWAYS_INLINE void DoNotOptimize(Tp const& value) {
   internal::UseCharPointer(&reinterpret_cast<char const volatile&>(value));
 }
-// FIXME Add ClobberMemory() for non-gnu compilers
+// FIXME Add ClobberMemory() for non-gnu and non-msvc compilers
 #endif
 
 
@@ -432,13 +444,7 @@ class State {
   // REQUIRES: a benchmark has exited its KeepRunning loop.
   void SetLabel(const char* label);
 
-  // Allow the use of std::string without actually including <string>.
-  // This function does not participate in overload resolution unless StringType
-  // has the nested typename `basic_string`. This typename should be provided
-  // as an injected class name in the case of std::string.
-  template <class StringType>
-  void SetLabel(StringType const& str,
-                typename internal::EnableIfString<StringType>::type = 1) {
+  void BENCHMARK_ALWAYS_INLINE SetLabel(const std::string& str) {
     this->SetLabel(str.c_str());
   }
 
@@ -577,8 +583,16 @@ class Benchmark {
 
   // Set the minimum amount of time to use when running this benchmark. This
   // option overrides the `benchmark_min_time` flag.
-  // REQUIRES: `t > 0`
+  // REQUIRES: `t > 0` and `Iterations` has not been called on this benchmark.
   Benchmark* MinTime(double t);
+
+  // Specify the amount of iterations that should be run by this benchmark.
+  // REQUIRES: 'n > 0' and `MinTime` has not been called on this benchmark.
+  //
+  // NOTE: This function should only be used when *exact* iteration control is
+  //   needed and never to control or limit how long a benchmark runs, where
+  // `--benchmark_min_time=N` or `MinTime(...)` should be used instead.
+  Benchmark* Iterations(size_t n);
 
   // Specify the amount of times to repeat this benchmark. This option overrides
   // the `benchmark_repetitions` flag.
@@ -668,6 +682,7 @@ class Benchmark {
   TimeUnit time_unit_;
   int range_multiplier_;
   double min_time_;
+  size_t iterations_;
   int repetitions_;
   bool use_real_time_;
   bool use_manual_time_;
@@ -691,6 +706,10 @@ internal::Benchmark* RegisterBenchmark(const char* name,
 template <class Lambda>
 internal::Benchmark* RegisterBenchmark(const char* name, Lambda&& fn);
 #endif
+
+// Remove all registered benchmarks. All pointers to previously registered
+// benchmarks are invalidated.
+void ClearRegisteredBenchmarks();
 
 namespace internal {
 // The class used to hold all Benchmarks created from static function.

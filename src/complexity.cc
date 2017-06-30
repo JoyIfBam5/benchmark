@@ -35,9 +35,9 @@ BigOFunc* FittingCurve(BigO complexity) {
     case oNCubed:
       return [](int n) -> double { return std::pow(n, 3); };
     case oLogN:
-      return [](int n) { return std::log2(n); };
+      return [](int n) { return log2(n); };
     case oNLogN:
-      return [](int n) { return n * std::log2(n); };
+      return [](int n) { return n * log2(n); };
     case o1:
     default:
       return [](int) { return 1.0; };
@@ -194,16 +194,16 @@ std::vector<BenchmarkReporter::Run> ComputeStats(
     CHECK_EQ(run_iterations, run.iterations);
     if (run.error_occurred) continue;
     real_accumulated_time_stat +=
-        Stat1_d(run.real_accumulated_time / run.iterations, run.iterations);
+        Stat1_d(run.real_accumulated_time / run.iterations);
     cpu_accumulated_time_stat +=
-        Stat1_d(run.cpu_accumulated_time / run.iterations, run.iterations);
-    items_per_second_stat += Stat1_d(run.items_per_second, run.iterations);
-    bytes_per_second_stat += Stat1_d(run.bytes_per_second, run.iterations);
+        Stat1_d(run.cpu_accumulated_time / run.iterations);
+    items_per_second_stat += Stat1_d(run.items_per_second);
+    bytes_per_second_stat += Stat1_d(run.bytes_per_second);
     // user counters
     for(auto const& cnt : run.counters) {
       auto it = counter_stats.find(cnt.first);
       CHECK_NE(it, counter_stats.end());
-      it->second.s += Stat1_d(cnt.second, run.iterations);
+      it->second.s += Stat1_d(cnt.second);
     }
   }
 
@@ -295,6 +295,11 @@ std::vector<BenchmarkReporter::Run> ComputeBigO(
   big_o.report_big_o = true;
   big_o.complexity = result_cpu.complexity;
 
+  // All the time results are reported after being multiplied by the
+  // time unit multiplier. But since RMS is a relative quantity it
+  // should not be multiplied at all. So, here, we _divide_ it by the
+  // multiplier so that when it is multiplied later the result is the
+  // correct one.
   double multiplier = GetTimeUnitMultiplier(reports[0].time_unit);
 
   // Only add label to mean/stddev if it is same for all runs
@@ -307,6 +312,9 @@ std::vector<BenchmarkReporter::Run> ComputeBigO(
   rms.cpu_accumulated_time = result_cpu.rms / multiplier;
   rms.report_rms = true;
   rms.complexity = result_cpu.complexity;
+  // don't forget to keep the time unit, or we won't be able to
+  // recover the correct value.
+  rms.time_unit = reports[0].time_unit;
 
   results.push_back(big_o);
   results.push_back(rms);
