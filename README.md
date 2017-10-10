@@ -18,6 +18,8 @@ IRC channel: https://freenode.net #googlebenchmark
 Define a function that executes the code to be measured.
 
 ```c++
+#include <benchmark/benchmark.h>
+
 static void BM_StringCreation(benchmark::State& state) {
   while (state.KeepRunning())
     std::string empty_string;
@@ -35,6 +37,8 @@ BENCHMARK(BM_StringCopy);
 
 BENCHMARK_MAIN();
 ```
+
+Don't forget to inform your linker to add benchmark library e.g. through `-lbenchmark` compilation flag.
 
 ### Passing arguments
 Sometimes a family of benchmarks can be implemented with just one routine that
@@ -181,7 +185,7 @@ BENCHMARK_TEMPLATE(BM_Sequential, WaitQueue<int>)->Range(1<<0, 1<<10);
 Three macros are provided for adding benchmark templates.
 
 ```c++
-#if __cplusplus >= 201103L // C++11 and greater.
+#ifdef BENCHMARK_HAS_CXX11
 #define BENCHMARK_TEMPLATE(func, ...) // Takes any number of parameters.
 #else // C++ < C++11
 #define BENCHMARK_TEMPLATE(func, arg1)
@@ -199,11 +203,11 @@ The `test_case_name` is appended to the name of the benchmark and
 should describe the values passed.
 
 ```c++
-template <class ...ExtraArgs>`
+template <class ...ExtraArgs>
 void BM_takes_args(benchmark::State& state, ExtraArgs&&... extra_args) {
   [...]
 }
-// Registers a benchmark named "BM_takes_args/int_string_test` that passes
+// Registers a benchmark named "BM_takes_args/int_string_test" that passes
 // the specified values to `extra_args`.
 BENCHMARK_CAPTURE(BM_takes_args, int_string_test, 42, std::string("abc"));
 ```
@@ -223,8 +227,7 @@ scope, the `RegisterBenchmark` can be called anywhere. This allows for
 benchmark tests to be registered programmatically.
 
 Additionally `RegisterBenchmark` allows any callable object to be registered
-as a benchmark. Including capturing lambdas and function objects. This
-allows the creation
+as a benchmark. Including capturing lambdas and function objects.
 
 For Example:
 ```c++
@@ -241,7 +244,7 @@ int main(int argc, char** argv) {
 ### Multithreaded benchmarks
 In a multithreaded test (benchmark invoked by multiple threads simultaneously),
 it is guaranteed that none of the threads will start until all have called
-`KeepRunning`, and all will have finished before KeepRunning returns false. As
+`KeepRunning`, and all will have finished before `KeepRunning` returns `false`. As
 such, any global setup or teardown can be wrapped in a check against the thread
 index:
 
@@ -274,7 +277,7 @@ Without `UseRealTime`, CPU time is used by default.
 ## Manual timing
 For benchmarking something for which neither CPU time nor real-time are
 correct or accurate enough, completely manual timing is supported using
-the `UseManualTime` function. 
+the `UseManualTime` function.
 
 When `UseManualTime` is used, the benchmarked code must call
 `SetIterationTime` once per iteration of the `KeepRunning` loop to
@@ -384,7 +387,7 @@ the minimum time, or the wallclock time is 5x minimum time. The minimum time is
 set as a flag `--benchmark_min_time` or per benchmark by calling `MinTime` on
 the registered benchmark object.
 
-## Reporting the mean and standard devation by repeated benchmarks
+## Reporting the mean, median and standard deviation by repeated benchmarks
 By default each benchmark is run once and that single result is reported.
 However benchmarks are often noisy and a single result may not be representative
 of the overall behavior. For this reason it's possible to repeatedly rerun the
@@ -392,19 +395,42 @@ benchmark.
 
 The number of runs of each benchmark is specified globally by the
 `--benchmark_repetitions` flag or on a per benchmark basis by calling
-`Repetitions` on the registered benchmark object. When a benchmark is run
-more than once the mean and standard deviation of the runs will be reported.
+`Repetitions` on the registered benchmark object. When a benchmark is run more
+than once the mean, median and standard deviation of the runs will be reported.
 
 Additionally the `--benchmark_report_aggregates_only={true|false}` flag or
 `ReportAggregatesOnly(bool)` function can be used to change how repeated tests
 are reported. By default the result of each repeated run is reported. When this
-option is 'true' only the mean and standard deviation of the runs is reported.
+option is `true` only the mean, median and standard deviation of the runs is reported.
 Calling `ReportAggregatesOnly(bool)` on a registered benchmark object overrides
 the value of the flag for that benchmark.
 
+## User-defined statistics for repeated benchmarks
+While having mean, median and standard deviation is nice, this may not be
+enough for everyone. For example you may want to know what is the largest
+observation, e.g. because you have some real-time constraints. This is easy.
+The following code will specify a custom statistic to be calculated, defined
+by a lambda function.
+
+```c++
+void BM_spin_empty(benchmark::State& state) {
+  while (state.KeepRunning()) {
+    for (int x = 0; x < state.range(0); ++x) {
+      benchmark::DoNotOptimize(x);
+    }
+  }
+}
+
+BENCHMARK(BM_spin_empty)
+  ->ComputeStatistics("max", [](const std::vector<double>& v) -> double {
+    return *(std::max_element(std::begin(v), std::end(v)));
+  })
+  ->Arg(512);
+```
+
 ## Fixtures
 Fixture tests are created by
-first defining a type that derives from ::benchmark::Fixture and then
+first defining a type that derives from `::benchmark::Fixture` and then
 creating/registering the tests using the following macros:
 
 * `BENCHMARK_F(ClassName, Method)`
@@ -432,6 +458,31 @@ BENCHMARK_REGISTER_F(MyFixture, BarTest)->Threads(2);
 /* BarTest is now registered */
 ```
 
+### Templated fixtures
+Also you can create templated fixture by using the following macros:
+
+* `BENCHMARK_TEMPLATE_F(ClassName, Method, ...)`
+* `BENCHMARK_TEMPLATE_DEFINE_F(ClassName, Method, ...)`
+
+For example:
+```c++
+template<typename T>
+class MyFixture : public benchmark::Fixture {};
+
+BENCHMARK_TEMPLATE_F(MyFixture, IntTest, int)(benchmark::State& st) {
+   while (st.KeepRunning()) {
+     ...
+  }
+}
+
+BENCHMARK_TEMPLATE_DEFINE_F(MyFixture, DoubleTest, double)(benchmark::State& st) {
+   while (st.KeepRunning()) {
+     ...
+  }
+}
+
+BENCHMARK_REGISTER_F(MyFixture, DoubleTest)->Threads(2);
+```
 
 ## User-defined counters
 
@@ -614,7 +665,7 @@ The library supports multiple output formats. Use the
 is the default format.
 
 The Console format is intended to be a human readable format. By default
-the format generates color output. Context is output on stderr and the 
+the format generates color output. Context is output on stderr and the
 tabular data on stdout. Example tabular output looks like:
 ```
 Benchmark                               Time(ns)    CPU(ns) Iterations
